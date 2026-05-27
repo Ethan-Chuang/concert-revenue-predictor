@@ -171,6 +171,138 @@ def find_peers(idx, data, min_peers=10):
 
 
 # =====================================================================
+# 4d. Pricing-recommendation pipeline (tab 2)
+# =====================================================================
+def _most_common_onehot(events, model_features, prefix):
+    """Return the one-hot column for `prefix` that fires most often in `events`."""
+    cols = [c for c in model_features if c.startswith(prefix)]
+    if not cols:
+        return None
+    counts = events[cols].sum()
+    return counts.idxmax() if counts.sum() > 0 else None
+
+
+def get_recommendation(
+    artist_name, venue_name, event_date,
+    df, model, scaler_stats, model_features,
+    elasticity=-0.5,
+):
+    """
+    Two-stage pipeline for an artist+venue+date query.
+
+    Stage 1: look up the artist's historical signals (Wiki, GT, past tickets,
+             etc.) and the venue's attributes (capacity, market, city, state).
+             Build a feature row from those + date-derived features.
+    Stage 2: predict tickets at a reference price, then sweep candidate prices
+             and apply elasticity to choose the revenue-maximizing one.
+
+    Returns (best_row, curve_df, context_dict) or raises ValueError if the
+    artist or venue isn't in the dataset.
+    """
+    artist_events = df[df["headliner"] == artist_name]
+    venue_events = df[df["venue"] == venue_name]
+    if len(artist_events) == 0:
+        raise ValueError(f"No events for artist '{artist_name}' in dataset")
+    if len(venue_events) == 0:
+        raise ValueError(f"Venue '{venue_name}' not found in dataset")
+
+    # Default to dataset medians, then override with artist + venue signals
+    row = df[model_features].median().to_dict()
+
+    artist_numeric = [
+        "gt_avg_13w", "gt_max_13w", "gt_std_13w", "gt_momentum_13w",
+        "wiki_avg_views_30d", "historical_concerts", "past_year_avg_tickets",
+        "career_age", "days_since_last_album", "album_release_last_12m",
+    ]
+    for col in artist_numeric:
+        if col in row and col in artist_events.columns:
+            row[col] = float(artist_events[col].median())
+
+    # Artist's most-played genre
+    winner = _most_common_onehot(artist_events, model_features, "genre_cleaned_")
+    if winner:
+        for c in model_features:
+            if c.startswith("genre_cleaned_"):
+                row[c] = int(c == winner)
+
+    # Venue numeric attributes
+    venue_numeric = ["avg_event_capacity", "market_population", "median_income", "population"]
+    for col in venue_numeric:
+        if col in row and col in venue_events.columns:
+            row[col] = float(venue_events[col].median())
+
+    # Venue location one-hots
+    for prefix in ["city_cleaned_", "state_cleaned_", "market_cleaned_"]:
+        winner = _most_common_onehot(venue_events, model_features, prefix)
+        if winner:
+            for c in model_features:
+                if c.startswith(prefix):
+                    row[c] = int(c == winner)
+
+    # Date-derived features (not z-scored)
+    d = event_date
+    row["year"] = d.year
+    row["year_offset"] = d.year - 2020
+    row["month_sin"] = np.sin(2 * np.pi * d.month / 12)
+    row["month_cos"] = np.cos(2 * np.pi * d.month / 12)
+    dow = d.weekday()
+    row["day_of_week_sin"] = np.sin(2 * np.pi * dow / 7)
+    row["day_of_week_cos"] = np.cos(2 * np.pi * dow / 7)
+    row["lockdown"] = int(date(2020, 3, 15) <= d <= date(2021, 7, 1))
+
+    for col in ["is_missing_support", "is_missing_genre", "is_missing_album_dates"]:
+        if col in row:
+            row[col] = 0
+
+    row_series = pd.Series(row)[model_features]
+
+    # Reference price: blend artist's and venue's historical medians
+    artist_price = to_real(artist_events["ticket_price_avg"].median(),
+                           "ticket_price_avg", scaler_stats)
+    venue_price = to_real(venue_events["ticket_price_avg"].median(),
+                          "ticket_price_avg", scaler_stats)
+    reference_price = (artist_price + venue_price) / 2
+
+    capacity_z = float(venue_events["avg_event_capacity"].median())
+    capacity_real = to_real(capacity_z, "avg_event_capacity", scaler_stats)
+
+    # Stage 1 prediction at the reference price (most reliable point)
+    e = row_series.copy()
+    e["ticket_price_avg"] = to_scaled(reference_price, "ticket_price_avg", scaler_stats)
+    e["avg_event_capacity"] = capacity_z
+    pred_z = max(float(model.predict(pd.DataFrame([e]))[0]), 0)
+    base_tickets = max(to_real(pred_z, "avg_tickets_sold", scaler_stats), 0)
+
+    # Stage 2: sweep prices around the reference, apply elasticity, score revenue
+    multipliers = np.linspace(0.3, 3.0, 55)
+    candidate_prices = reference_price * multipliers
+
+    rows = []
+    for p_real in candidate_prices:
+        pct = (p_real - reference_price) / reference_price
+        demand_mult = max(1 + elasticity * pct, 0.1)
+        adjusted = base_tickets * demand_mult
+        tickets = min(adjusted, capacity_real) if capacity_real > 0 else adjusted
+        fill = (tickets / capacity_real * 100) if capacity_real > 0 else 0
+        rev = p_real * tickets
+        rows.append({"price": p_real, "tickets": tickets, "fill": fill, "revenue": rev})
+
+    curve = pd.DataFrame(rows)
+    best = curve.loc[curve["revenue"].idxmax()].to_dict()
+
+    context = {
+        "artist_events": int(len(artist_events)),
+        "venue_events": int(len(venue_events)),
+        "capacity": capacity_real,
+        "artist_typical_price": artist_price,
+        "venue_typical_price": venue_price,
+        "reference_price": reference_price,
+        "base_tickets_at_reference": base_tickets,
+    }
+    return best, curve, context
+
+
+# =====================================================================
 # 4b. Custom artist row builder (tab 2)
 # =====================================================================
 ONEHOT_GROUPS = {
@@ -330,7 +462,7 @@ st.caption(
     "(original artifacts only)."
 )
 
-tab1, tab2, tab3 = st.tabs(["Existing event", "Custom artist", "Model performance"])
+tab1, tab2, tab3 = st.tabs(["Existing event", "Pricing recommendation", "Model performance"])
 
 
 # ---- Sidebar (shared by tab 1; elasticity also used by tab 2) ----
@@ -458,132 +590,134 @@ with tab1:
 # TAB 2 — custom artist input form
 # =====================================================================
 with tab2:
-    st.subheader("Predict revenue for a hypothetical artist/event")
+    st.subheader("Pricing recommendation")
     st.caption(
-        "Fill in the form below. Google Trends and other unfilled signals "
-        "default to dataset medians."
+        "Pick an artist, venue, and event date. The model uses the artist's "
+        "historical signals + the venue's known attributes to recommend the "
+        "revenue-maximizing ticket price (using the elasticity from the "
+        "sidebar)."
     )
 
-    with st.form("custom_predict"):
+    with st.form("rec_form"):
         c1, c2, c3 = st.columns(3)
-
         with c1:
-            st.markdown("**Artist**")
-            artist_name = st.text_input("Name (display only)", "")
-            genre = st.selectbox(
-                "Genre",
-                ["pop_rock", "country", "latin", "rap_hiphop", "dance_electronic", "other"],
+            artists_list = sorted(df["headliner"].dropna().unique())
+            default_a = "Lianne La Havas" if "Lianne La Havas" in artists_list else artists_list[0]
+            rec_artist = st.selectbox(
+                "Artist (headliner)", artists_list,
+                index=artists_list.index(default_a),
             )
-            career_age = st.number_input("Career age (years)", 0, 60, 10)
-            hist_concerts = st.number_input("Total historical concerts", 0, 5000, 50)
-            wiki_views = st.number_input("Avg daily Wikipedia views (30d)", 0, 200000, 500)
-            past_year_tix = st.number_input("Past year avg tickets per show", 0, 100000, 2000)
-            days_since_album = st.number_input("Days since last album", 0, 5000, 365)
-
         with c2:
-            st.markdown("**Event**")
-            event_date_in = st.date_input("Event date", date(2025, 6, 15))
-            market = st.selectbox(
-                "Market",
-                ["new_york", "chicago", "los_angeles", "boston_manchester",
-                 "washington_dc_hagerstown", "other"],
-            )
-            city = st.selectbox(
-                "City",
-                ["new_york", "chicago", "boston", "portland", "washington", "other"],
-            )
-            state = st.selectbox(
-                "State",
-                ["california", "florida", "massachusetts", "new_york", "texas", "other"],
-            )
-            capacity = st.number_input("Venue capacity (seats)", 50, 100000, 2000)
-
+            venues_list = sorted(df["venue"].dropna().unique())
+            rec_venue = st.selectbox("Venue", venues_list)
         with c3:
-            st.markdown("**Pricing**")
-            price = st.number_input("Ticket price ($)", 5, 1000, 50)
-            st.markdown("---")
-            st.markdown("**Output**")
-            sweep_caps = st.checkbox("Also sweep across 3 venue sizes", value=True)
-            st.caption(
-                f"Elasticity = {elasticity} (from sidebar). Only matters for the "
-                f"sweep below; the single-point prediction is the raw model output."
-            )
+            rec_date = st.date_input("Event date", date(2026, 7, 15))
 
-        submitted = st.form_submit_button("Predict revenue", type="primary")
+        rec_submit = st.form_submit_button("Get pricing recommendation", type="primary")
 
-    if submitted:
-        inputs = {
-            "genre": genre, "city": city, "state": state, "market": market,
-            "career_age": career_age, "hist_concerts": hist_concerts,
-            "wiki_views": wiki_views, "past_year_tix": past_year_tix,
-            "days_since_album": days_since_album,
-            "event_date": event_date_in,
-            "capacity": capacity, "price": price,
-        }
-
-        row = build_custom_row(inputs, scaler_stats, model_features, df)
-
-        # Single-point prediction
-        pred_z = max(float(model.predict(pd.DataFrame([row]))[0]), 0)
-        pred_tickets = max(to_real(pred_z, "avg_tickets_sold", scaler_stats), 0)
-        tickets = min(pred_tickets, capacity)
-        revenue = price * tickets
-        fill = tickets / capacity * 100 if capacity > 0 else 0
-
-        st.divider()
-        st.subheader(f"Prediction{' for ' + artist_name if artist_name else ''}")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Predicted tickets", f"{tickets:,.0f}")
-        m2.metric("Implied fill rate", f"{fill:.0f}%")
-        m3.metric("Predicted revenue", f"${revenue:,.0f}")
-        m4.metric("Capacity", f"{capacity:,.0f}")
-
-        # Context histograms
-        st.divider()
-        st.subheader("Context: how this prediction compares to the dataset")
-        all_preds = compute_predictions(model, df, scaler_stats, tuple(model_features))
-        ctx1, ctx2 = st.columns(2)
-        with ctx1:
-            st.pyplot(make_distribution_with_marker(
-                all_preds["pred_tickets"].values, tickets,
-                "Predicted tickets vs all 1808 events",
-                "Predicted tickets",
-            ))
-        with ctx2:
-            st.pyplot(make_distribution_with_marker(
-                all_preds["pred_revenue"].values, revenue,
-                "Predicted revenue vs all 1808 events",
-                "Predicted revenue ($)",
-            ))
-
-        if sweep_caps:
-            st.divider()
-            st.subheader("Revenue grid: 3 prices × 3 venue sizes")
-            prices_real_grid = np.array([price * 0.7, price, price * 1.4])
-            caps_real_grid = np.array([capacity * 0.6, capacity, capacity * 1.5])
-            prices_z_grid = np.array(
-                [to_scaled(p, "ticket_price_avg", scaler_stats) for p in prices_real_grid]
-            )
-            caps_z_grid = np.array(
-                [to_scaled(c, "avg_event_capacity", scaler_stats) for c in caps_real_grid]
-            )
-
-            revs, _, fls, pr, cr = score_grid(
-                row, prices_z_grid, caps_z_grid, model, scaler_stats,
+    if rec_submit:
+        try:
+            best, curve, ctx = get_recommendation(
+                rec_artist, rec_venue, rec_date,
+                df, model, scaler_stats, model_features,
                 elasticity=elasticity,
             )
-            best = np.unravel_index(np.argmax(revs), revs.shape)
+        except ValueError as err:
+            st.error(str(err))
+            st.stop()
 
-            colL, colR = st.columns([2, 1])
-            with colL:
-                st.pyplot(make_heatmap(revs, fls, pr, cr, best))
-            with colR:
-                st.markdown("**Recommendation**")
-                st.write(f"Price: **${pr[best[1]]:,.0f}**")
-                st.write(f"Capacity: **{cr[best[0]]:,.0f} seats**")
-                st.write(f"Fill: **{fls[best]:.0f}%**")
-                st.write(f"Revenue: **${revs[best]:,.0f}**")
+        # --- Top-line recommendation ---
+        st.divider()
+        st.subheader(f"Recommendation: {rec_artist} at {rec_venue}")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Recommended price", f"${best['price']:,.0f}")
+        m2.metric("Predicted tickets", f"{best['tickets']:,.0f}")
+        m3.metric("Predicted fill", f"{best['fill']:.0f}%")
+        m4.metric("Predicted revenue", f"${best['revenue']:,.0f}")
+
+        if elasticity == 0:
+            st.warning(
+                "Elasticity = 0 in the sidebar. With no demand response to "
+                "price, the recommendation will always be the highest "
+                "feasible price (revenue grows linearly with price up to the "
+                "capacity cap). Slide elasticity to roughly -0.3 to -0.7 in "
+                "the sidebar for a realistic recommendation."
+            )
+
+        # --- Revenue curve ---
+        st.divider()
+        st.subheader("Predicted revenue across price levels")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(curve["price"], curve["revenue"], color="#2D8B4E", lw=2.5,
+                label="Predicted revenue")
+        ax.axvline(best["price"], color="gold", linestyle="--", lw=2,
+                   label=f"recommended  ${best['price']:,.0f}")
+        ax.axvline(ctx["reference_price"], color="#888", linestyle=":", lw=1.5,
+                   label=f"reference  ${ctx['reference_price']:,.0f}")
+        ax.set_xlabel("Ticket price ($)")
+        ax.set_ylabel("Predicted revenue ($)")
+        ax.set_title(f"Revenue vs ticket price  (elasticity = {elasticity})")
+        ax.legend(loc="best")
+        ax.grid(alpha=0.3)
+        st.pyplot(fig)
+
+        st.caption(
+            "**Reference price** = average of the artist's historical median "
+            "and the venue's typical price. The model predicts ticket demand "
+            "at the reference, then elasticity adjusts demand for prices "
+            "above/below it."
+        )
+
+        # --- Context details ---
+        st.divider()
+        st.subheader("Inputs the model used")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.markdown("**Artist signal**")
+            artist_rows = df[df["headliner"] == rec_artist]
+            st.write(f"Events in dataset: **{ctx['artist_events']}**")
+            st.write(f"Typical historical price: **${ctx['artist_typical_price']:,.0f}**")
+            wiki_views = to_real(
+                artist_rows["wiki_avg_views_30d"].median(),
+                "wiki_avg_views_30d", scaler_stats,
+            )
+            past_yr = to_real(
+                artist_rows["past_year_avg_tickets"].median(),
+                "past_year_avg_tickets", scaler_stats,
+            )
+            hist_c = to_real(
+                artist_rows["historical_concerts"].median(),
+                "historical_concerts", scaler_stats,
+            )
+            st.write(f"Wikipedia avg daily views: **{wiki_views:,.0f}**")
+            st.write(f"Past year avg tickets/show: **{past_yr:,.0f}**")
+            st.write(f"Historical concert count: **{hist_c:,.0f}**")
+        with cc2:
+            st.markdown("**Venue**")
+            venue_rows = df[df["venue"] == rec_venue]
+            st.write(f"Events in dataset: **{ctx['venue_events']}**")
+            st.write(f"Capacity: **{ctx['capacity']:,.0f} seats**")
+            st.write(f"Typical price at this venue: **${ctx['venue_typical_price']:,.0f}**")
+            market_label = venue_rows["market"].mode().iloc[0] if not venue_rows["market"].mode().empty else "n/a"
+            st.write(f"Market: **{market_label}**")
+            st.write(f"Event date: **{rec_date}** ({rec_date.strftime('%A')})")
+
+        # --- Curve table for download ---
+        st.divider()
+        with st.expander("Full revenue curve (table)"):
+            tbl = curve.copy()
+            tbl["price"] = tbl["price"].round(0)
+            tbl["tickets"] = tbl["tickets"].round(0)
+            tbl["fill"] = tbl["fill"].round(0)
+            tbl["revenue"] = tbl["revenue"].round(0)
+            st.dataframe(tbl, hide_index=True, use_container_width=True)
+            st.download_button(
+                "Download as CSV",
+                data=tbl.to_csv(index=False).encode("utf-8"),
+                file_name=f"recommendation_{rec_artist[:20]}_{rec_date}.csv",
+                mime="text/csv",
+            )
 
 
 # =====================================================================
