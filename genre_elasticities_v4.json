@@ -1,0 +1,49 @@
+{
+  "overall": {
+    "beta": 0.11496145986790914,
+    "r2_through_origin": 0.005777124105833309,
+    "n_events": 1784,
+    "n_artists": 127
+  },
+  "by_genre": {
+    "Country": {
+      "beta": 0.061948043140046254,
+      "r2_through_origin": 0.0009203984623658013,
+      "n_events": 215,
+      "n_artists": 4
+    },
+    "Dance / Electronic": {
+      "beta": 0.6018736276376002,
+      "r2_through_origin": 0.1400934495916104,
+      "n_events": 74,
+      "n_artists": 7
+    },
+    "Latin": {
+      "beta": 0.09705689169286034,
+      "r2_through_origin": 0.01245015732100041,
+      "n_events": 233,
+      "n_artists": 7
+    },
+    "Other": {
+      "beta": 0.08331921723268021,
+      "r2_through_origin": 0.002194668667252153,
+      "n_events": 337,
+      "n_artists": 30
+    },
+    "Pop / Rock": {
+      "beta": 0.05877724510079348,
+      "r2_through_origin": 0.002314540310673241,
+      "n_events": 803,
+      "n_artists": 71
+    },
+    "Rap / HipHop": {
+      "beta": -0.07285066530415951,
+      "r2_through_origin": 0.0011320239886052352,
+      "n_events": 92,
+      "n_artists": 8
+    }
+  },
+  "min_events_per_artist": 3,
+  "min_events_per_genre": 30,
+  "method": "OLS within-artist demeaning, log-log"
+}
