@@ -31,17 +31,34 @@ from xgboost import XGBRegressor
 st.set_page_config(page_title="Concert Revenue Predictor", layout="wide")
 
 # =====================================================================
-# 2. Paths — resolved relative to this file so the app works both
-# locally and on Streamlit Cloud (which sets CWD to the repo root,
-# not to model/).
+# 2. Paths — resolve in either the proper folder layout (model/ + data/)
+# or a flattened layout (everything dumped at the repo root, which is
+# what happens when files get uploaded via GitHub's web UI).
 # =====================================================================
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = REPO_ROOT / "data"
-DF_PATH = DATA_DIR / "test_sample_cleaned_apr8.csv"
-SCALER_PATH = DATA_DIR / "scaler_stats_apr8.json"
-MODEL_PATH = DATA_DIR / "stage1_ticket_sales_model.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SEARCH_DIRS = [
+    SCRIPT_DIR.parent / "data",  # local layout: /repo/model/dashboard.py -> /repo/data/
+    SCRIPT_DIR / "data",         # flat-with-data-subfolder
+    SCRIPT_DIR,                  # everything dumped at the same level as dashboard.py
+    SCRIPT_DIR.parent,           # ditto, one level up
+]
+
+
+def _find(name):
+    for d in SEARCH_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"Could not find {name}. Searched: {[str(d) for d in SEARCH_DIRS]}"
+    )
+
+
+DF_PATH = _find("test_sample_cleaned_apr8.csv")
+SCALER_PATH = _find("scaler_stats_apr8.json")
+MODEL_PATH = _find("stage1_ticket_sales_model.json")
 
 
 # =====================================================================
