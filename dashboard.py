@@ -56,9 +56,9 @@ def _find(name):
     )
 
 
-DF_PATH = _find("test_sample_cleaned_apr8.csv")
+DF_PATH = _find("test_sample_cleaned_expanded.csv")
 SCALER_PATH = _find("scaler_stats_apr8.json")
-MODEL_PATH = _find("stage1_ticket_sales_model.json")
+MODEL_PATH = _find("stage1_ticket_sales_model_expanded_wiki.json")
 
 
 # =====================================================================
